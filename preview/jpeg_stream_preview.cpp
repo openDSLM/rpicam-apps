@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -342,4 +343,3 @@ Preview *make_jpeg_stream_preview(Options const *options)
 {
         return new JpegStreamPreview(options);
 }
-

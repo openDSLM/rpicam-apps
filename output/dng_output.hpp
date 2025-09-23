@@ -12,7 +12,7 @@
 #include <queue>
 #include <string>
 
-#include <libcamera/control_list.h>
+#include <libcamera/controls.h>
 
 #include "core/stream_info.hpp"
 #include "core/video_options.hpp"
@@ -25,7 +25,7 @@ public:
         DngOutput(VideoOptions const *options, StreamInfo const &info, std::string camera_model);
 
         void outputBuffer(void *mem, size_t size, int64_t timestamp_us, uint32_t flags) override;
-        void MetadataReady(libcamera::ControlList &metadata) override;
+        void MetadataReady(libcamera::ControlList &metadata);
 
 private:
         std::string nextFilename();
@@ -41,4 +41,3 @@ private:
         std::condition_variable metadata_cv_;
         std::queue<libcamera::ControlList> metadata_queue_;
 };
-
