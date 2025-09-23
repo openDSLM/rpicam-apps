@@ -120,8 +120,9 @@ struct Options
 	bool nopreview;
 	std::string preview;
 	bool fullscreen;
-	unsigned int preview_x, preview_y, preview_width, preview_height;
-	libcamera::Transform transform;
+        unsigned int preview_x, preview_y, preview_width, preview_height;
+        std::string preview_stream;
+        libcamera::Transform transform;
 	std::string roi;
 	float roi_x, roi_y, roi_width, roi_height;
 	TimeVal<std::chrono::microseconds> shutter;

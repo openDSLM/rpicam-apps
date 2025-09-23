@@ -1,4 +1,5 @@
 rpicam_app_src += files([
+    'dng_output.cpp',
     'circular_output.cpp',
     'file_output.cpp',
     'net_output.cpp',
@@ -6,6 +7,7 @@ rpicam_app_src += files([
 ])
 
 output_headers = [
+    'dng_output.hpp',
     'circular_output.hpp',
     'file_output.hpp',
     'net_output.hpp',

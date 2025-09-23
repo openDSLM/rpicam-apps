@@ -225,10 +225,12 @@ Options::Options()
 			"Set a custom location for the post-processing library .so files")
 		("nopreview,n", value<bool>(&nopreview)->default_value(false)->implicit_value(true),
 			"Do not show a preview window")
-		("preview,p", value<std::string>(&preview)->default_value("0,0,0,0"),
-			"Set the preview window dimensions, given as x,y,width,height e.g. 0,0,640,480")
-		("fullscreen,f", value<bool>(&fullscreen)->default_value(false)->implicit_value(true),
-			"Use a fullscreen preview window")
+                ("preview,p", value<std::string>(&preview)->default_value("0,0,0,0"),
+                        "Set the preview window dimensions, given as x,y,width,height e.g. 0,0,640,480")
+                ("preview-stream", value<std::string>(&preview_stream)->default_value(""),
+                        "Serve the preview as an MJPEG stream on host:port (use just a port to bind all interfaces)")
+                ("fullscreen,f", value<bool>(&fullscreen)->default_value(false)->implicit_value(true),
+                        "Use a fullscreen preview window")
 		("qt-preview", value<bool>(&qt_preview)->default_value(false)->implicit_value(true),
 			"Use Qt-based preview window (WARNING: causes heavy CPU load, fullscreen not supported)")
 		("hflip", value<bool>(&hflip_)->default_value(false)->implicit_value(true), "Request a horizontal flip transform")
@@ -666,12 +668,13 @@ void Options::Print() const
 		std::cerr << "    preview: none" << std::endl;
 	else if (fullscreen)
 		std::cerr << "    preview: fullscreen" << std::endl;
-	else if (preview_width == 0 || preview_height == 0)
-		std::cerr << "    preview: default" << std::endl;
-	else
-		std::cerr << "    preview: " << preview_x << "," << preview_y << "," << preview_width << ","
-					<< preview_height << std::endl;
-	std::cerr << "    qt-preview: " << qt_preview << std::endl;
+        else if (preview_width == 0 || preview_height == 0)
+                std::cerr << "    preview: default" << std::endl;
+        else
+                std::cerr << "    preview: " << preview_x << "," << preview_y << "," << preview_width << ","
+                                           << preview_height << std::endl;
+        std::cerr << "    preview-stream: " << (preview_stream.empty() ? "off" : preview_stream) << std::endl;
+        std::cerr << "    qt-preview: " << qt_preview << std::endl;
 	std::cerr << "    transform: " << transformToString(transform) << std::endl;
 	if (roi_width == 0 || roi_height == 0)
 		std::cerr << "    roi: all" << std::endl;

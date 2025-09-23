@@ -1,5 +1,6 @@
 rpicam_app_src += files([
     'null_preview.cpp',
+    'jpeg_stream_preview.cpp',
     'preview.cpp',
 ])
 

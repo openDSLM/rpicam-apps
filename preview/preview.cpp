@@ -13,11 +13,14 @@ Preview *make_null_preview(Options const *options);
 Preview *make_egl_preview(Options const *options);
 Preview *make_drm_preview(Options const *options);
 Preview *make_qt_preview(Options const *options);
+Preview *make_jpeg_stream_preview(Options const *options);
 
 Preview *make_preview(Options const *options)
 {
-	if (options->nopreview)
-		return make_null_preview(options);
+        if (!options->preview_stream.empty())
+                return make_jpeg_stream_preview(options);
+        if (options->nopreview)
+                return make_null_preview(options);
 #if QT_PRESENT
 	else if (options->qt_preview)
 	{
