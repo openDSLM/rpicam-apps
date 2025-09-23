@@ -8,6 +8,11 @@ Build
 -----
 For usage and build instructions, see the official Raspberry Pi documentation pages [here.](https://www.raspberrypi.com/documentation/computers/camera_software.html#building-libcamera-and-rpicam-apps)
 
+Documentation
+-------------
+
+- CinemaDNG recorder with MJPEG preview: `docs/rpicam-cinedng.md`
+
 License
 -------
 
