@@ -368,6 +368,27 @@ bool CameraDaemon::updateSettings(JsonObject const &values, std::string &error_m
                 updated.output_dir = *path;
         }
 
+        if (auto it = values.find("mode"); it != values.end())
+        {
+                auto mode = it->second.asString();
+                if (!mode)
+                {
+                        error_message = "mode must be a string";
+                        return false;
+                }
+                try
+                {
+                        Mode check(*mode);
+                        (void)check;
+                }
+                catch (std::exception const &ex)
+                {
+                        error_message = std::string("Invalid mode: ") + ex.what();
+                        return false;
+                }
+                updated.mode = *mode;
+        }
+
         settings_ = updated;
         session_.last_error.clear();
         return true;
@@ -489,6 +510,7 @@ std::string CameraDaemon::buildSettingsJson(CameraSettings const &settings)
              << ",\"analogue_gain\":" << settings.analogue_gain
              << ",\"auto_exposure\":" << (settings.auto_exposure ? "true" : "false")
              << ",\"output_dir\":" << jsonString(settings.output_dir)
+             << ",\"mode\":" << jsonString(settings.mode)
              << "}";
         return json.str();
 }
@@ -807,6 +829,17 @@ void CameraDaemon::applySettingsToOptions(CameraSettings const &settings, VideoO
         options.no_raw = !request_raw;
         options.output = request_raw ? settings.output_dir : std::string();
         options.framerate = settings.fps;
+
+        if (!settings.mode.empty())
+        {
+                options.mode_string = settings.mode;
+                options.mode = Mode(settings.mode);
+        }
+        else
+        {
+                options.mode_string.clear();
+                options.mode = Mode();
+        }
 
         // Do not force a raw mode size; mirror rpicam-cinedng behavior and
         // let libcamera adjust to the closest supported sensor mode.

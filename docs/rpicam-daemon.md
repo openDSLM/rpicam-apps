@@ -43,7 +43,8 @@ Returns the current session state, settings and summary of the last capture:
     "shutter_us": 0.0,
     "analogue_gain": 1.0,
     "auto_exposure": true,
-    "output_dir": "/ssd/RAW"
+    "output_dir": "/ssd/RAW",
+    "mode": ""
   },
   "last_capture": null
 }
@@ -75,12 +76,21 @@ fields:
 - `analogue_gain` – analogue gain (> 0)
 - `auto_exposure` – boolean toggle for automatic exposure
 - `output_dir` – directory where CinemaDNG files are written (defaults to `/ssd/RAW`)
+- `mode` – optional sensor mode string (`W:H:bit-depth:P|U`) used to pick a specific RAW resolution; empty string resets to automatic selection
 
-Example payload:
+Example payloads:
 
 ```json
 {"fps": 25.0, "auto_exposure": false, "shutter_us": 40000, "analogue_gain": 2.0}
 ```
+
+```json
+{"mode": "3856:2180:12:P", "fps": 25.0, "auto_exposure": true}
+```
+
+The second example selects a 4K (≈UHD) RAW mode typical of the IMX477. Run
+`rpicam-cinedng --list-cameras` on the target to confirm the exact modes your
+sensor exposes; the string can be copied directly into the daemon settings.
 
 ### `POST /capture/still`
 
@@ -134,8 +144,19 @@ curl http://localhost:8400/status | jq
 # Configure a 25 fps pipeline with manual exposure (1/25s) and gain 2x
 curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"fps":25.0,"auto_exposure":false,"shutter_us":40000,"analogue_gain":2.0}'
 
+# Switch to a 4K/UHD sensor mode (example for IMX477) at 25 fps
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"3856:2180:12:P","fps":25.0}'
+
+# Switch back to an HD/1080p raw mode (same sensor) at 25 fps
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"2028:1080:12:P","fps":25.0}'
+
 # Capture a single CinemaDNG still
 curl -X POST http://localhost:8400/capture/still
+
+# Quick sequence: jump to UHD, grab a still, then return to HD
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"3856:2180:12:P","fps":25.0}'
+curl -X POST http://localhost:8400/capture/still
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"2028:1080:12:P","fps":25.0}'
 
 # Fetch a JPEG preview frame
 curl http://localhost:8400/preview --output preview.jpg

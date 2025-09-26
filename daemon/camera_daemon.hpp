@@ -29,6 +29,7 @@ struct CameraSettings
         double analogue_gain = 1.0;
         bool auto_exposure = true;
         std::string output_dir = "/ssd/RAW";
+        std::string mode;
 };
 
 enum class SessionMode
