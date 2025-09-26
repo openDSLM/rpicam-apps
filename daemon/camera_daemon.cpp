@@ -489,6 +489,13 @@ bool CameraDaemon::capturePreviewSnapshot(CameraSettings const &settings, std::v
 {
         try
         {
+                // Avoid concurrent CameraManager instances by serialising camera access.
+                std::unique_lock<std::mutex> cam_lock(camera_guard_, std::try_to_lock);
+                if (!cam_lock.owns_lock())
+                {
+                        error = "Camera busy (another preview/recording in progress)";
+                        return false;
+                }
                 PreviewEncoder app;
                 VideoOptions *options = app.GetOptions();
                 // Ensure Options are default-initialised to avoid undefined values.
@@ -901,6 +908,32 @@ void CameraDaemon::registerRoutes()
                 response.body.assign(reinterpret_cast<const char *>(jpeg.data()), jpeg.size());
                 return response;
         });
+
+        server_.addStreamHandler("GET", "/preview/stream", [this](int client_fd, HttpRequest const &)
+        {
+                // If a stream is already active, refuse additional clients for now.
+                bool expected = false;
+                if (!streaming_active_.compare_exchange_strong(expected, true))
+                {
+                        const char *busy =
+                                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
+                                "Content-Length: 38\r\nConnection: close\r\n\r\n{\"error\":\"Preview stream busy\"}";
+                        ::send(client_fd, busy, strlen(busy), 0);
+                        return;
+                }
+
+                // Write streaming headers
+                const char *hdr =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Connection: close\r\n"
+                        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                        "Pragma: no-cache\r\n"
+                        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+                ::send(client_fd, hdr, strlen(hdr), 0);
+
+                streamPreviewMJPEG(client_fd);
+                streaming_active_.store(false);
+        });
 }
 
 void CameraDaemon::joinFinishedVideoThread()
@@ -957,6 +990,111 @@ bool CameraDaemon::stopActiveVideo(std::string &error_message)
         if (thread.joinable())
                 thread.join();
         return true;
+}
+
+void CameraDaemon::streamPreviewMJPEG(int client_fd)
+{
+        // Serialise camera usage for the entire stream lifetime
+        std::unique_lock<std::mutex> cam_lock(camera_guard_, std::defer_lock);
+        cam_lock.lock();
+
+        try
+        {
+                PreviewEncoder app;
+                VideoOptions *options = app.GetOptions();
+                // Default-initialise Options
+                char arg0[] = "rpicam-daemon";
+                char *argv[] = { arg0 };
+                int argc = 1;
+                options->Parse(argc, argv);
+
+                CameraSettings settings = getSettings();
+                applySettingsToOptions(settings, *options, false);
+                int quality = 85;
+
+                app.OpenCamera();
+                app.ConfigureVideo();
+
+                StreamInfo stream_info;
+                libcamera::Stream *stream = app.VideoStream(&stream_info);
+                if (!stream)
+                        throw std::runtime_error("Video stream unavailable for preview");
+                if (stream_info.pixel_format != libcamera::formats::YUV420)
+                        throw std::runtime_error("Preview stream must be YUV420");
+
+                std::atomic<bool> client_ok{true};
+                // Prepare encoder callbacks to convert and send frames
+                app.SetEncodeOutputReadyCallback([&](void *mem, size_t size, int64_t, bool) {
+                        if (!client_ok.load())
+                                return;
+                        try
+                        {
+                                libcamera::Span<uint8_t> span(static_cast<uint8_t *>(mem), size);
+                                std::vector<uint8_t> jpeg = encodeFrameToJpeg(span, stream_info, quality);
+                                if (jpeg.empty())
+                                        return;
+                                char header[256];
+                                int n = snprintf(header, sizeof(header),
+                                                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                                                 jpeg.size());
+                                if (n < 0)
+                                {
+                                        client_ok.store(false);
+                                        return;
+                                }
+                                if (::send(client_fd, header, n, 0) < 0)
+                                {
+                                        client_ok.store(false);
+                                        return;
+                                }
+                                if (::send(client_fd, reinterpret_cast<const char *>(jpeg.data()), jpeg.size(), 0) < 0)
+                                {
+                                        client_ok.store(false);
+                                        return;
+                                }
+                                static const char *crlf = "\r\n";
+                                if (::send(client_fd, crlf, 2, 0) < 0)
+                                {
+                                        client_ok.store(false);
+                                        return;
+                                }
+                        }
+                        catch (...)
+                        {
+                                client_ok.store(false);
+                        }
+                });
+
+                app.StartEncoder();
+                app.StartCamera();
+
+                while (client_ok.load())
+                {
+                        RPiCamEncoder::Msg msg = app.Wait();
+                        if (msg.type == RPiCamApp::MsgType::Timeout)
+                        {
+                                LOG_ERROR("Device timeout detected, attempting a restart");
+                                app.StopCamera();
+                                app.StartCamera();
+                                continue;
+                        }
+                        if (msg.type == RPiCamEncoder::MsgType::Quit)
+                                break;
+                        if (msg.type != RPiCamEncoder::MsgType::RequestComplete)
+                                throw std::runtime_error("Unrecognised message from camera");
+
+                        CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
+                        if (!app.EncodeBuffer(completed_request, stream))
+                                continue;
+                }
+
+                app.StopCamera();
+                app.StopEncoder();
+        }
+        catch (std::exception const &ex)
+        {
+                LOG_ERROR("Preview stream ended: " << ex.what());
+        }
 }
 
 } // namespace rpicam

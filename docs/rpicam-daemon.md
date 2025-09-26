@@ -109,6 +109,19 @@ Returns the latest preview frame as a single JPEG image. The response has
 `Content-Type: image/jpeg` and disables HTTP caching so that clients always see
 the current camera view.
 
+### `GET /preview/stream`
+
+Returns a live MJPEG stream that browsers can display and refresh continuously.
+The response uses `Content-Type: multipart/x-mixed-replace` and sends a
+sequence of JPEG images. Example usages:
+
+- Browser: open `http://localhost:8400/preview/stream`
+- `curl`: `curl -N http://localhost:8400/preview/stream > stream.mjpeg`
+
+Notes:
+- One stream client at a time (additional clients receive HTTP 409).
+- While streaming, single-shot preview `/preview` will return 503 (camera busy).
+
 ## Example commands
 
 The following `curl` commands illustrate a typical workflow on the default

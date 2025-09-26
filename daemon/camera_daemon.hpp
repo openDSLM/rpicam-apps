@@ -77,10 +77,10 @@ private:
         static std::string modeToString(SessionMode mode);
         static std::string buildCaptureJson(CaptureSummary const &capture);
 
-        static CaptureResult runCineDngCapture(CameraSettings const &settings, bool single_shot,
-                                                std::atomic<bool> *stop_flag);
-        static bool capturePreviewSnapshot(CameraSettings const &settings, std::vector<uint8_t> &jpeg,
-                                           std::string &error);
+        CaptureResult runCineDngCapture(CameraSettings const &settings, bool single_shot,
+                                        std::atomic<bool> *stop_flag);
+        bool capturePreviewSnapshot(CameraSettings const &settings, std::vector<uint8_t> &jpeg,
+                                    std::string &error);
         static bool ensureOutputDirectory(std::string const &path, std::string &error_message);
         static void applySettingsToOptions(CameraSettings const &settings, VideoOptions &options,
                                            bool request_raw);
@@ -89,6 +89,7 @@ private:
         void joinFinishedVideoThread();
         void runVideoCapture(CameraSettings settings);
         bool stopActiveVideo(std::string &error_message);
+        void streamPreviewMJPEG(int client_fd);
 
         mutable std::mutex mutex_;
         SimpleHttpServer server_;
@@ -97,7 +98,10 @@ private:
         CaptureSummary last_capture_;
         std::atomic<bool> video_stop_flag_;
         std::thread video_thread_;
+
+        // Serialize libcamera usage to avoid multiple CameraManager instances
+        std::mutex camera_guard_;
+        std::atomic<bool> streaming_active_{false};
 };
 
 } // namespace rpicam
-

@@ -46,11 +46,13 @@ class SimpleHttpServer
 {
 public:
         using Handler = std::function<HttpResponse(const HttpRequest &)>;
+        using StreamHandler = std::function<void(int /*client_fd*/, const HttpRequest &)>;
 
         SimpleHttpServer();
         ~SimpleHttpServer();
 
         void addHandler(const std::string &method, const std::string &path, Handler handler);
+        void addStreamHandler(const std::string &method, const std::string &path, StreamHandler handler);
         void start(uint16_t port);
         void stop();
 
@@ -77,6 +79,7 @@ private:
         };
 
         std::map<HandlerKey, Handler, KeyCompare> handlers_;
+        std::map<HandlerKey, StreamHandler, KeyCompare> stream_handlers_;
         std::atomic<bool> running_;
         std::thread listen_thread_;
         int server_fd_;
@@ -94,6 +97,12 @@ inline void SimpleHttpServer::addHandler(const std::string &method, const std::s
 {
         std::lock_guard<std::mutex> lock(handler_mutex_);
         handlers_[{method, path}] = std::move(handler);
+}
+
+inline void SimpleHttpServer::addStreamHandler(const std::string &method, const std::string &path, StreamHandler handler)
+{
+        std::lock_guard<std::mutex> lock(handler_mutex_);
+        stream_handlers_[{method, path}] = std::move(handler);
 }
 
 inline void SimpleHttpServer::start(uint16_t port)
@@ -186,11 +195,27 @@ inline void SimpleHttpServer::handleClient(int client_fd)
         }
 
         Handler handler;
+        StreamHandler stream_handler;
         {
                 std::lock_guard<std::mutex> lock(handler_mutex_);
                 auto it = handlers_.find({request.method, request.target});
                 if (it != handlers_.end())
                         handler = it->second;
+                else
+                {
+                        auto it2 = stream_handlers_.find({request.method, request.target});
+                        if (it2 != stream_handlers_.end())
+                                stream_handler = it2->second;
+                }
+        }
+
+        if (stream_handler)
+        {
+                // Stream handler takes responsibility for sending the full response.
+                // When it returns, we close the connection.
+                stream_handler(client_fd, request);
+                ::close(client_fd);
+                return;
         }
 
         HttpResponse response;
@@ -286,4 +311,3 @@ inline std::string SimpleHttpServer::trim(const std::string &value)
 }
 
 } // namespace rpicam
-
