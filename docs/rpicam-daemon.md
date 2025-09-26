@@ -76,7 +76,7 @@ fields:
 - `analogue_gain` – analogue gain (> 0)
 - `auto_exposure` – boolean toggle for automatic exposure
 - `output_dir` – directory where CinemaDNG files are written (defaults to `/ssd/RAW`)
-- `mode` – optional sensor mode string (`W:H:bit-depth:P|U`) used to pick a specific RAW resolution; empty string resets to automatic selection
+- `mode` – optional sensor mode string (`W:H:bit-depth:P|U`) used to pick a specific RAW resolution; empty string resets to automatic selection. Use `rpicam-cinedng --list-cameras` to confirm exact values (e.g. the HQ/IMX477 lists `1928x1090` for HD and `3856x2180` for 4K).
 
 Example payloads:
 
@@ -85,12 +85,16 @@ Example payloads:
 ```
 
 ```json
-{"mode": "3856:2180:12:P", "fps": 25.0, "auto_exposure": true}
+{"mode": "1928:1090:12:P", "fps": 25.0, "auto_exposure": true}
 ```
 
-The second example selects a 4K (≈UHD) RAW mode typical of the IMX477. Run
-`rpicam-cinedng --list-cameras` on the target to confirm the exact modes your
-sensor exposes; the string can be copied directly into the daemon settings.
+```json
+{"mode": "3856:2180:12:P", "fps": 25.0}
+```
+
+The HD example matches the HQ/IMX477 sensor's 1:1 cropped mode (≈1080p). The 4K
+example selects the same sensor's full-resolution crop. If your camera lists
+different values, copy the strings that appear under `--list-cameras`.
 
 ### `POST /capture/still`
 
@@ -144,11 +148,11 @@ curl http://localhost:8400/status | jq
 # Configure a 25 fps pipeline with manual exposure (1/25s) and gain 2x
 curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"fps":25.0,"auto_exposure":false,"shutter_us":40000,"analogue_gain":2.0}'
 
-# Switch to a 4K/UHD sensor mode (example for IMX477) at 25 fps
+# Switch to a 4K/UHD raw mode (IMX477 example) at 25 fps
 curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"3856:2180:12:P","fps":25.0}'
 
-# Switch back to an HD/1080p raw mode (same sensor) at 25 fps
-curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"2028:1080:12:P","fps":25.0}'
+# Switch back to an HD/1080p raw mode (IMX477 example) at 25 fps
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"1928:1090:12:P","fps":25.0}'
 
 # Capture a single CinemaDNG still
 curl -X POST http://localhost:8400/capture/still
@@ -156,7 +160,7 @@ curl -X POST http://localhost:8400/capture/still
 # Quick sequence: jump to UHD, grab a still, then return to HD
 curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"3856:2180:12:P","fps":25.0}'
 curl -X POST http://localhost:8400/capture/still
-curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"2028:1080:12:P","fps":25.0}'
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"mode":"1928:1090:12:P","fps":25.0}'
 
 # Fetch a JPEG preview frame
 curl http://localhost:8400/preview --output preview.jpg
