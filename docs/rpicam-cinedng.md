@@ -34,6 +34,13 @@ After installation the binary is available as `rpicam-cinedng`.
   - `rpicam-cinedng --mode 2028:1520:12:P --framerate 24 -o clip-%08u.dng`
   - For 1080p/25fps recording on HQ/Global Shutter modules:
     - `rpicam-cinedng --mode 2028:1080:12:P --framerate 25 -t 60s -o /mnt/ssd/clip-%06u.dng`
+  - For 4K/25fps using sensor-aligned RAW (typical IMX477):
+    - `rpicam-cinedng --mode 3856:2180:12:P --framerate 25 -t 60s -o /mnt/ssd/clip-4k-%06u.dng`
+    - Tip: run `rpicam-cinedng --list-cameras` and pick an exact RAW mode listed for your sensor. On HQ (IMX477), 3856×2180 and 1928×1090 align with native RAW strides and avoid packing edge cases.
+  - For IMX585 4K/25fps examples (sizes vary by pipeline):
+    - Full sensor (common): `rpicam-cinedng --mode 3864:2192:12:P --framerate 25 -t 60s -o /mnt/ssd/clip-4k-%06u.dng`
+    - Exact UHD crop (if enumerated): `rpicam-cinedng --mode 3840:2160:12:P --framerate 25 -t 60s -o /mnt/ssd/clip-4k-%06u.dng`
+    - If you see packing/stride issues, try unpacked: replace `:12:P` with `:12:U`, or drop to 10‑bit: `:10:P`.
 
 ## Output & Naming
 
@@ -131,4 +138,3 @@ below target, lower FPS/resolution or move the output to faster media.
 - CinemaDNG writing to stdout is not supported.
 - MJPEG preview has no authentication; protect it at the network level.
 - Actual sensor modes and limits depend on the camera module and libcamera pipeline.
-

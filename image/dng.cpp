@@ -65,8 +65,6 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats =
 
 	{ formats::R10_CSI2P, { "BGGR-10", 10, TIFF_BGGR, true, false } },
 	{ formats::R10, { "BGGR-10", 10, TIFF_BGGR, false, false } },
-	// Currently not in the main libcamera branch
-	//{ formats::R12_CSI2P, { "BGGR-12", 12, TIFF_BGGR, true } },
 	{ formats::R12, { "BGGR-12", 12, TIFF_BGGR, false, false } },
 
 	/* PiSP compressed formats. */
@@ -75,6 +73,46 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats =
 	{ formats::GBRG_PISP_COMP1, { "GBRG-16-PISP", 16, TIFF_GBRG, false, true } },
 	{ formats::BGGR_PISP_COMP1, { "BGGR-16-PISP", 16, TIFF_BGGR, false, true } },
 };
+
+// Fallback parser for Bayer formats that may not be listed above
+// (e.g., new libcamera PixelFormats or sensor-specific aliases).
+static bool parse_bayer_from_string(const PixelFormat &fmt, BayerFormat &out)
+{
+	std::string s = fmt.toString();
+	if (s.empty())
+		return false;
+
+	int bits = 12;
+	bool packed = false;
+	bool compressed = false;
+
+	if (s.find("16") != std::string::npos)
+		bits = 16;
+	else if (s.find("14") != std::string::npos)
+		bits = 14;
+	else if (s.find("12") != std::string::npos)
+		bits = 12;
+	else if (s.find("10") != std::string::npos)
+		bits = 10;
+
+	if (s.find("PISP_COMP1") != std::string::npos)
+		compressed = true; // PiSP compressed RAW is not packed in memory
+	else if (s.find("CSI2P") != std::string::npos)
+		packed = true; // CSI-2 packed RAW
+
+	char const *order = TIFF_BGGR; // safe default
+	if (s.find("RGGB") != std::string::npos)
+		order = TIFF_RGGB;
+	else if (s.find("GRBG") != std::string::npos)
+		order = TIFF_GRBG;
+	else if (s.find("GBRG") != std::string::npos)
+		order = TIFF_GBRG;
+	else if (s.find("BGGR") != std::string::npos)
+		order = TIFF_BGGR;
+
+	out = { "parsed", bits, order, packed, compressed };
+	return true;
+}
 
 static void unpack_10bit(uint8_t const *src, StreamInfo const &info, uint16_t *dest)
 {
@@ -302,9 +340,11 @@ void dng_save(std::vector<libcamera::Span<uint8_t>> const &mem, StreamInfo const
 	// Check the Bayer format and unpack it to u16.
 
 	auto it = bayer_formats.find(info.pixel_format);
-	if (it == bayer_formats.end())
+	BayerFormat bayer_format;
+	if (it != bayer_formats.end())
+		bayer_format = it->second;
+	else if (!parse_bayer_from_string(info.pixel_format, bayer_format))
 		throw std::runtime_error("unsupported Bayer format");
-	BayerFormat const &bayer_format = it->second;
 	LOG(1, "Bayer format is " << bayer_format.name);
 
 	// Decompression will require a buffer that's 8 pixels aligned.
