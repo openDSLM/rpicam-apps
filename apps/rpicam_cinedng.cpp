@@ -6,6 +6,9 @@
  */
 
 #include <chrono>
+#include <cstdint>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 #include "core/rpicam_encoder.hpp"
@@ -41,7 +44,11 @@ static void event_loop(LibcameraCineDng &app)
         app.StartCamera();
 
         auto start_time = std::chrono::high_resolution_clock::now();
+        auto capture_start_time = start_time;
+        auto stats_start_time = start_time;
         unsigned int frames_captured = 0;
+        unsigned int stats_frames_captured = 0;
+        uint64_t total_frames_captured = 0;
 
         while (true)
         {
@@ -81,15 +88,50 @@ static void event_loop(LibcameraCineDng &app)
                 if (!app.EncodeBuffer(completed_request, raw_stream))
                 {
                         start_time = std::chrono::high_resolution_clock::now();
+                        stats_start_time = start_time;
                         frames_captured = 0;
+                        stats_frames_captured = 0;
                         continue;
                 }
 
+                total_frames_captured++;
                 frames_captured++;
+                stats_frames_captured++;
+
+                now = std::chrono::high_resolution_clock::now();
+                auto stats_elapsed = now - stats_start_time;
+                if (stats_elapsed >= std::chrono::seconds(1))
+                {
+                        double interval_seconds =
+                                std::chrono::duration_cast<std::chrono::duration<double>>(stats_elapsed).count();
+                        double interval_fps = interval_seconds > 0.0 ? stats_frames_captured / interval_seconds : 0.0;
+                        std::ostringstream stats_stream;
+                        stats_stream << std::fixed << std::setprecision(2) << interval_fps;
+                        LOG(1, "CinemaDNG write rate: " << stats_stream.str() << " fps over " << stats_frames_captured
+                                                        << " frames (total " << total_frames_captured << ")");
+                        stats_start_time = now;
+                        stats_frames_captured = 0;
+                }
         }
 
         app.StopCamera();
         app.StopEncoder();
+
+        auto capture_end_time = std::chrono::high_resolution_clock::now();
+        auto capture_duration = capture_end_time - capture_start_time;
+        if (total_frames_captured > 0 && capture_duration > std::chrono::nanoseconds(0))
+        {
+                double total_seconds =
+                        std::chrono::duration_cast<std::chrono::duration<double>>(capture_duration).count();
+                double average_fps = total_seconds > 0.0 ? total_frames_captured / total_seconds : 0.0;
+                std::ostringstream summary_stream;
+                summary_stream << std::fixed << std::setprecision(2) << average_fps;
+                LOG(1, "CinemaDNG session average: " << summary_stream.str() << " fps across "
+                                                    << total_frames_captured << " frames in "
+                                                    << std::chrono::duration_cast<std::chrono::milliseconds>(capture_duration)
+                                                               .count()
+                                                    << " ms");
+        }
 }
 
 int main(int argc, char *argv[])

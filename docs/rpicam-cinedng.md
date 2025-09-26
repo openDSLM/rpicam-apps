@@ -32,6 +32,8 @@ After installation the binary is available as `rpicam-cinedng`.
   - `rpicam-cinedng -t 10s -o frames/%08u.dng --preview-stream :8080`
 - Specify sensor mode and FPS:
   - `rpicam-cinedng --mode 2028:1520:12:P --framerate 24 -o clip-%08u.dng`
+  - For 1080p/25fps recording on HQ/Global Shutter modules:
+    - `rpicam-cinedng --mode 2028:1080:12:P --framerate 25 -t 60s -o /mnt/ssd/clip-%06u.dng`
 
 ## Output & Naming
 
@@ -99,6 +101,16 @@ throughput ≈ bytes_per_frame × fps
 - Packed 12‑bit reduces size vs 16‑bit; compressed PiSP RAW reduces further.
 - Use fast storage (SSD/USB3). SD cards may drop frames at higher resolutions/FPS.
 - If you encounter dropped frames, reduce `--framerate`, lower resolution, or switch to faster media.
+
+## Monitoring Capture Rate
+
+`rpicam-cinedng` periodically prints write statistics (requires `-v 1` or higher):
+
+- `CinemaDNG write rate: 25.02 fps over 25 frames (total 250)` – instantaneous FPS over the last second.
+- `CinemaDNG session average: 24.98 fps across 250 frames in 10005 ms` – final summary once capture stops.
+
+Use these logs to confirm that storage keeps up with the requested frame rate (e.g. 25 fps for 1080p sequences). If rates dip
+below target, lower FPS/resolution or move the output to faster media.
 
 ## Troubleshooting
 
