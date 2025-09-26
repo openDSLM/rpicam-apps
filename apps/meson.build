@@ -34,6 +34,12 @@ rpicam_jpeg = executable('rpicam-jpeg', files('rpicam_jpeg.cpp'),
                          link_with : rpicam_app,
                          install : true)
 
+rpicam_daemon = executable('rpicam-daemon',
+                           files('rpicam_daemon.cpp', '../daemon/camera_daemon.cpp'),
+                           include_directories : include_directories('..'),
+                           dependencies: threads_dep,
+                           install : true)
+
 # Install symlinks to the old app names for legacy purposes.
 install_symlink('libcamera-still',
                 install_dir: get_option('bindir'),
