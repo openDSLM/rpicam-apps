@@ -1,7 +1,9 @@
 # rpicam-daemon
 
-`rpicam-daemon` is an experimental HTTP process that exposes an API for DSLR-style
-workflows. The daemon is intended to grow into the backend that powers the Open DSLM UI.
+`rpicam-daemon` exposes a small HTTP API for DSLR-style workflows on top of the
+`rpicam-apps` pipeline. The daemon now drives the camera for CinemaDNG stills
+and video capture, serves preview frames, and keeps the most recent capture
+metadata in memory. By default all recordings are written to `/ssd/RAW`.
 
 ## Building
 
@@ -22,12 +24,12 @@ The process blocks and serves until a `SIGINT`/`SIGTERM` is delivered.
 
 ## HTTP endpoints
 
-All endpoints exchange JSON bodies. Responses always set `Content-Type` to
-`application/json`.
+All JSON endpoints accept and return UTF-8 encoded JSON. Unless noted otherwise
+the daemon responds with `Content-Type: application/json`.
 
 ### `GET /status`
 
-Returns the current session state and settings:
+Returns the current session state, settings and summary of the last capture:
 
 ```json
 {
@@ -40,10 +42,24 @@ Returns the current session state and settings:
     "fps": 24.0,
     "shutter_us": 0.0,
     "analogue_gain": 1.0,
-    "auto_exposure": true
-  }
+    "auto_exposure": true,
+    "output_dir": "/ssd/RAW"
+  },
+  "last_capture": null
 }
 ```
+
+`last_capture` becomes a structure such as
+
+```json
+{
+  "type": "still",
+  "frames": ["/ssd/RAW/frame-00000000.dng"],
+  "count": 1
+}
+```
+
+whenever a capture finishes successfully.
 
 ### `GET /settings`
 
@@ -51,45 +67,81 @@ Returns only the current settings block.
 
 ### `POST /settings`
 
-Updates the camera settings. Only the provided keys are modified. All keys are
-optional but must obey the following rules:
+Updates the camera settings. Only the provided keys are modified. Supported
+fields:
 
 - `fps` – floating point frames per second (> 0)
 - `shutter_us` – shutter time in microseconds (≥ 0)
 - `analogue_gain` – analogue gain (> 0)
-- `auto_exposure` – boolean
+- `auto_exposure` – boolean toggle for automatic exposure
+- `output_dir` – directory where CinemaDNG files are written (defaults to `/ssd/RAW`)
 
 Example payload:
 
 ```json
-{"fps": 25.0, "auto_exposure": false}
+{"fps": 25.0, "auto_exposure": false, "shutter_us": 40000, "analogue_gain": 2.0}
 ```
 
-### `POST /session`
+### `POST /capture/still`
 
-Starts a logical capture session.
-
-Payload:
+Triggers a single CinemaDNG frame. The request blocks until the frame has been
+written. The response contains the filenames that were created:
 
 ```json
-{"mode": "cinemadng"}
+{"frames":["/ssd/RAW/frame-00000017.dng"],"count":1}
 ```
 
-Supported modes are `preview`, `still`, `video`, `cinemadng` and `none`.
-If a session is already running the endpoint returns HTTP 409.
+A HTTP 409 is returned if another session is already active.
 
-### `DELETE /session`
+### `POST /recordings/video`
 
-Stops the active session. Returns HTTP 409 if nothing is running.
+Starts a CinemaDNG video recording that runs until it is explicitly stopped.
+The response contains the updated daemon status.
+
+### `DELETE /recordings/video`
+
+Stops the active video recording. A HTTP 409 is returned if no recording is
+running.
 
 ### `GET /preview`
 
-Currently returns HTTP 503 – the preview transport will be wired up in a
-follow-up change.
+Returns the latest preview frame as a single JPEG image. The response has
+`Content-Type: image/jpeg` and disables HTTP caching so that clients always see
+the current camera view.
 
-## Notes
+## Example commands
 
-This daemon currently tracks settings and state in-memory without driving the
-camera pipeline. The skeleton allows the UI to integrate while the capture,
-CinemaDNG output and HTTP streaming support are implemented incrementally.
+The following `curl` commands illustrate a typical workflow on the default
+port (8400):
 
+```bash
+# Query status
+curl http://localhost:8400/status | jq
+
+# Configure a 25 fps pipeline with manual exposure (1/25s) and gain 2x
+curl -X POST http://localhost:8400/settings      -H 'Content-Type: application/json'      -d '{"fps":25.0,"auto_exposure":false,"shutter_us":40000,"analogue_gain":2.0}'
+
+# Capture a single CinemaDNG still
+curl -X POST http://localhost:8400/capture/still
+
+# Fetch a JPEG preview frame
+curl http://localhost:8400/preview --output preview.jpg
+
+# Start a CinemaDNG video recording
+curl -X POST http://localhost:8400/recordings/video
+
+# Stop the recording
+curl -X DELETE http://localhost:8400/recordings/video
+```
+
+The CinemaDNG files created by still and video captures are written to
+`/ssd/RAW` unless `output_dir` is changed via the settings endpoint.
+
+## Compatibility alias
+
+For convenience with older examples, the daemon also exposes a session endpoint:
+
+- `POST /session` with body `{ "mode": "still" | "video" | "none" }` starts a still capture, starts video recording, or clears any active session.
+- `DELETE /session` stops an active session (equivalent to `DELETE /recordings/video`).
+
+Prefer the dedicated endpoints above for clarity (`/capture/still` and `/recordings/video`).

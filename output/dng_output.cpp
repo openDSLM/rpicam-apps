@@ -99,5 +99,8 @@ void DngOutput::outputBuffer(void *mem, size_t size, int64_t, uint32_t)
 
         LOG(2, "Writing CinemaDNG frame to " << filename);
         dng_save(spans, info_, metadata, filename, camera_model_, nullptr);
+
+        if (frame_written_callback_)
+                frame_written_callback_(filename);
 }
 

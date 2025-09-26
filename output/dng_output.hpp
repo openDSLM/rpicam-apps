@@ -8,6 +8,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -26,6 +27,10 @@ public:
 
         void outputBuffer(void *mem, size_t size, int64_t timestamp_us, uint32_t flags) override;
         void MetadataReady(libcamera::ControlList &metadata);
+        void SetFrameWrittenCallback(std::function<void(std::string const &)> callback)
+        {
+                frame_written_callback_ = std::move(callback);
+        }
 
 private:
         std::string nextFilename();
@@ -40,4 +45,5 @@ private:
         std::mutex metadata_mutex_;
         std::condition_variable metadata_cv_;
         std::queue<libcamera::ControlList> metadata_queue_;
+        std::function<void(std::string const &)> frame_written_callback_;
 };
