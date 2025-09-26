@@ -17,6 +17,8 @@
 #include "daemon/json_utils.hpp"
 #include "daemon/simple_http.hpp"
 
+class DngOutput; // forward declaration
+
 namespace rpicam
 {
 
@@ -86,22 +88,39 @@ private:
                                            bool request_raw);
 
         void registerRoutes();
-        void joinFinishedVideoThread();
-        void runVideoCapture(CameraSettings settings);
-        bool stopActiveVideo(std::string &error_message);
-        void streamPreviewMJPEG(int client_fd);
+        // Unified background camera loop
+        void cameraLoop();
+        void startCameraLoop();
+        void stopCameraLoop();
+        // Per-client MJPEG streaming writer
+        void streamClientLoop(int client_fd);
 
         mutable std::mutex mutex_;
         SimpleHttpServer server_;
         CameraSettings settings_;
         SessionState session_;
         CaptureSummary last_capture_;
-        std::atomic<bool> video_stop_flag_;
-        std::thread video_thread_;
 
-        // Serialize libcamera usage to avoid multiple CameraManager instances
+        // Background camera thread and control flags
+        std::thread camera_thread_;
+        std::atomic<bool> camera_stop_{false};
+        std::atomic<bool> camera_reconfigure_{false};
         std::mutex camera_guard_;
-        std::atomic<bool> streaming_active_{false};
+
+        // Latest preview frame (JPEG)
+        std::mutex preview_mutex_;
+        std::condition_variable preview_cv_;
+        std::vector<uint8_t> latest_jpeg_;
+        uint64_t preview_seq_ = 0;
+        bool preview_enabled_ = false; // generate preview from RAW when true
+
+        // Capture state shared with camera loop
+        std::mutex capture_mutex_;
+        std::shared_ptr<DngOutput> active_output_;
+        bool video_recording_ = false;
+        bool still_pending_ = false;
+        std::vector<std::string> still_result_;
+        std::condition_variable still_cv_;
 };
 
 } // namespace rpicam

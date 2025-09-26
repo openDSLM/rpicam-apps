@@ -607,6 +607,39 @@ void RPiCamApp::ConfigureVideo(unsigned int flags)
 	LOG(2, "Video setup complete");
 }
 
+void RPiCamApp::ConfigureRawOnly()
+{
+    LOG(2, "Configuring raw-only...");
+
+    StreamRoles stream_roles = { StreamRole::Raw };
+    configuration_ = camera_->generateConfiguration(stream_roles);
+    if (!configuration_)
+        throw std::runtime_error("failed to generate raw configuration");
+
+    // Select and apply the desired raw mode
+    // If a width/height has been requested by the app, keep them; otherwise take default.
+    options_->mode.update(configuration_->at(0).size, options_->framerate);
+    options_->mode = selectMode(options_->mode);
+
+    configuration_->at(0).size = options_->mode.Size();
+    configuration_->at(0).pixelFormat = mode_to_pixel_format(options_->mode);
+    if (options_->buffer_count > 0)
+        configuration_->at(0).bufferCount = options_->buffer_count;
+
+    configuration_->sensorConfig = libcamera::SensorConfiguration();
+    configuration_->sensorConfig->outputSize = options_->mode.Size();
+    configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
+    configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
+
+    setupCapture();
+
+    streams_["raw"] = configuration_->at(0).stream();
+
+    post_processor_.Configure();
+
+    LOG(2, "Raw-only setup complete");
+}
+
 void RPiCamApp::Teardown()
 {
 	stopPreview();

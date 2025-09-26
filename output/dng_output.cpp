@@ -103,4 +103,3 @@ void DngOutput::outputBuffer(void *mem, size_t size, int64_t, uint32_t)
         if (frame_written_callback_)
                 frame_written_callback_(filename);
 }
-

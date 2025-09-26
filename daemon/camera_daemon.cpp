@@ -21,6 +21,7 @@
 
 #include "core/logging.hpp"
 #include "core/rpicam_encoder.hpp"
+#include "core/buffer_sync.hpp"
 #include "core/stream_info.hpp"
 #include "encoder/null_encoder.hpp"
 #include "output/dng_output.hpp"
@@ -111,22 +112,180 @@ std::vector<uint8_t> encodeFrameToJpeg(libcamera::Span<uint8_t> span, StreamInfo
         return encoded;
 }
 
+// Minimal RAW unpack/decompress helpers (adapted from image/dng.cpp)
+__attribute__((unused)) static void unpack10(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
+{
+        unsigned int w_align = info.width & ~3u;
+        for (unsigned int y = 0; y < info.height; y++, src += info.stride)
+        {
+                const uint8_t *ptr = src;
+                unsigned int x;
+                for (x = 0; x < w_align; x += 4, ptr += 5)
+                {
+                        *dst++ = (ptr[0] << 2) | ((ptr[4] >> 0) & 3);
+                        *dst++ = (ptr[1] << 2) | ((ptr[4] >> 2) & 3);
+                        *dst++ = (ptr[2] << 2) | ((ptr[4] >> 4) & 3);
+                        *dst++ = (ptr[3] << 2) | ((ptr[4] >> 6) & 3);
+                }
+                for (; x < info.width; x++)
+                        *dst++ = (ptr[x & 3] << 2) | ((ptr[4] >> ((x & 3) << 1)) & 3);
+        }
+}
+
+__attribute__((unused)) static void unpack12(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
+{
+        unsigned int w_align = info.width & ~1u;
+        for (unsigned int y = 0; y < info.height; y++, src += info.stride)
+        {
+                const uint8_t *ptr = src;
+                unsigned int x;
+                for (x = 0; x < w_align; x += 2, ptr += 3)
+                {
+                        *dst++ = (ptr[0] << 4) | ((ptr[2] >> 0) & 15);
+                        *dst++ = (ptr[1] << 4) | ((ptr[2] >> 4) & 15);
+                }
+                if (x < info.width)
+                        *dst++ = (ptr[x & 1] << 4) | ((ptr[2] >> ((x & 1) << 2)) & 15);
+        }
+}
+
+__attribute__((unused)) static void unpack16(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
+{
+        unsigned int w = info.width;
+        for (unsigned int y = 0; y < info.height; y++)
+        {
+                memcpy(dst, src, 2 * w);
+                dst += w;
+                src += info.stride;
+        }
+}
+
+#define COMPRESS_OFFSET 2048
+#define COMPRESS_MODE 1
+static uint16_t pp_post(uint16_t a)
+{
+        if (COMPRESS_MODE & 2)
+        {
+                if (COMPRESS_MODE == 3 && a < 0x4000)
+                        a = a >> 2;
+                else if (a < 0x1000)
+                        a = a >> 4;
+                else if (a < 0x1800)
+                        a = (a - 0x800) >> 3;
+                else if (a < 0x3000)
+                        a = (a - 0x1000) >> 2;
+                else if (a < 0x6000)
+                        a = (a - 0x2000) >> 1;
+                else if (a < 0xC000)
+                        a = (a - 0x4000);
+                else
+                        a = 2 * (a - 0x8000);
+        }
+        return std::min<uint16_t>(0xFFFF, a + COMPRESS_OFFSET);
+}
+
+static uint16_t pp_dequant(uint16_t q, int qmode)
+{
+        switch (qmode)
+        {
+        case 0: return (q < 320) ? 16 * q : 32 * (q - 160);
+        case 1: return 64 * q;
+        case 2: return 128 * q;
+        default: return (q < 94) ? 256 * q : std::min(0xFFFF, (int)512 * (q - 47));
+        }
+}
+
+static void pp_subblock(uint16_t *d, uint32_t w)
+{
+        int q[4];
+        int qmode = (w & 3);
+        if (qmode < 3)
+        {
+                int field0 = (w >> 2) & 511;
+                int field1 = (w >> 11) & 127;
+                int field2 = (w >> 18) & 127;
+                int field3 = (w >> 25) & 127;
+                if (qmode == 2 && field0 >= 384)
+                {
+                        q[1] = field0;
+                        q[2] = field1 + 384;
+                }
+                else
+                {
+                        q[1] = (field1 >= 64) ? field0 : field0 + 64 - field1;
+                        q[2] = (field1 >= 64) ? field0 + field1 - 64 : field0;
+                }
+                int p1 = std::max(0, q[1] - 64);
+                if (qmode == 2) p1 = std::min(384, p1);
+                int p2 = std::max(0, q[2] - 64);
+                if (qmode == 2) p2 = std::min(384, p2);
+                q[0] = p1 + field2;
+                q[3] = p2 + field3;
+        }
+        else
+        {
+                int pack0 = (w >> 2) & 32767;
+                int pack1 = (w >> 17) & 32767;
+                q[0] = (pack0 & 15) + 16 * ((pack0 >> 8) / 11);
+                q[1] = (pack0 & 480) / 16 + 16 * ((pack0 >> 11) % 11);
+                q[2] = (pack1 & 15) + 16 * ((pack1 >> 8) / 11);
+                q[3] = (pack1 & 480) / 16 + 16 * ((pack1 >> 11) % 11);
+        }
+        d[0] = pp_post(pp_dequant(q[0], qmode));
+        d[1] = pp_post(pp_dequant(q[1], qmode));
+        d[2] = pp_post(pp_dequant(q[2], qmode));
+        d[3] = pp_post(pp_dequant(q[3], qmode));
+}
+
+static void uncompress_pisp(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
+{
+        // Decompression requires width padded to 8 pixels
+        unsigned int w = (info.width + 7) & ~7u;
+        unsigned int h = info.height;
+        std::vector<uint32_t> wdata(w * h / 2);
+
+        // First stage: dequantize
+        for (unsigned int i = 0; i < wdata.size(); i++)
+        {
+                int a = (src[0] << 0) | (src[1] << 8) | (src[2] << 16);
+                int b = (src[3] << 0) | (src[4] << 8) | (src[5] << 16);
+                wdata[i] = a | (b << 24);
+                src += 6;
+        }
+
+        // Second stage: process each 2x2 sub-block
+        std::vector<uint16_t> tmp(w * h);
+        uint32_t *wp = wdata.data();
+        for (unsigned int y = 0; y < h; y += 2)
+        {
+                for (unsigned int x = 0; x < w; x += 2)
+                {
+                        pp_subblock(&tmp[y * w + x], *wp++);
+                }
+        }
+
+        // Copy out to dst with original width stride
+        for (unsigned int y = 0; y < h; y++)
+        {
+                memcpy(&dst[y * info.width], &tmp[y * w], info.width * sizeof(uint16_t));
+        }
+}
+
 } // namespace
 
-CameraDaemon::CameraDaemon() : video_stop_flag_(false) {}
+CameraDaemon::CameraDaemon() {}
 
 void CameraDaemon::start(uint16_t port)
 {
         registerRoutes();
         server_.start(port);
+        startCameraLoop();
 }
 
 void CameraDaemon::stop()
 {
         server_.stop();
-        std::string ignored;
-        stopActiveVideo(ignored);
-        joinFinishedVideoThread();
+        stopCameraLoop();
 }
 
 SessionState CameraDaemon::getState() const
@@ -218,79 +377,63 @@ bool CameraDaemon::startSession(SessionMode mode, std::string &error_message)
 {
         if (mode == SessionMode::Still)
         {
-                CameraSettings settings;
+                // Fire a still capture using the background loop and wait for completion
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (session_.active)
-                        {
-                                error_message = "A session is already active";
-                                return false;
-                        }
-                        session_.mode = SessionMode::Still;
-                        session_.active = true;
-                        session_.last_error.clear();
-                        settings = settings_;
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        still_result_.clear();
+                        still_pending_ = true;
                 }
-
-                CaptureResult result = runCineDngCapture(settings, true, nullptr);
+                std::vector<std::string> frames;
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        session_.active = false;
-                        session_.mode = SessionMode::None;
-                        if (!result.success)
+                        std::unique_lock<std::mutex> lock(capture_mutex_);
+                        if (!still_cv_.wait_for(lock, std::chrono::seconds(5), [&]{ return !still_result_.empty(); }))
                         {
-                                session_.last_error = result.error;
-                                error_message = result.error;
+                                error_message = "Timed out waiting for still frame";
                                 return false;
                         }
+                        frames = still_result_;
+                        still_result_.clear();
+                }
+                {
+                        std::lock_guard<std::mutex> lock(mutex_);
                         last_capture_.type = "still";
-                        last_capture_.frames = std::move(result.frames);
+                        last_capture_.frames = std::move(frames);
+                        session_.last_error.clear();
                 }
                 return true;
         }
 
         if (mode == SessionMode::Video)
         {
-                joinFinishedVideoThread();
-
-                CameraSettings settings;
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (session_.active)
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        if (video_recording_)
                         {
-                                error_message = "A session is already active";
+                                error_message = "Video already recording";
                                 return false;
                         }
+                        video_recording_ = true;
+                }
+                {
+                        std::lock_guard<std::mutex> lock(mutex_);
                         session_.mode = SessionMode::Video;
                         session_.active = true;
                         session_.last_error.clear();
-                        settings = settings_;
-                        video_stop_flag_.store(false);
                 }
-
-                try
-                {
-                        video_thread_ = std::thread(&CameraDaemon::runVideoCapture, this, settings);
-                }
-                catch (std::exception const &ex)
-                {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        session_.active = false;
-                        session_.mode = SessionMode::None;
-                        session_.last_error = ex.what();
-                        error_message = ex.what();
-                        return false;
-                }
-
                 return true;
         }
 
         if (mode == SessionMode::None)
         {
-                if (stopActiveVideo(error_message))
-                        return true;
-                if (!error_message.empty())
-                        return false;
+                {
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        video_recording_ = false;
+                }
+                {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        session_.active = false;
+                        session_.mode = SessionMode::None;
+                }
                 error_message.clear();
                 return true;
         }
@@ -301,18 +444,21 @@ bool CameraDaemon::startSession(SessionMode mode, std::string &error_message)
 
 bool CameraDaemon::stopSession(std::string &error_message)
 {
-        if (stopActiveVideo(error_message))
-                return true;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!session_.active)
         {
-                error_message = "No active session";
-                return false;
+                std::lock_guard<std::mutex> lock(capture_mutex_);
+                if (!video_recording_)
+                {
+                        error_message = "No active session";
+                        return false;
+                }
+                video_recording_ = false;
         }
-
-        session_.active = false;
-        session_.mode = SessionMode::None;
-        session_.last_error.clear();
+        {
+                std::lock_guard<std::mutex> lock(mutex_);
+                session_.active = false;
+                session_.mode = SessionMode::None;
+                session_.last_error.clear();
+        }
         return true;
 }
 
@@ -662,6 +808,9 @@ void CameraDaemon::applySettingsToOptions(CameraSettings const &settings, VideoO
         options.output = request_raw ? settings.output_dir : std::string();
         options.framerate = settings.fps;
 
+        // Do not force a raw mode size; mirror rpicam-cinedng behavior and
+        // let libcamera adjust to the closest supported sensor mode.
+
         if (settings.auto_exposure)
         {
                 options.shutter.value = std::chrono::nanoseconds(0);
@@ -760,169 +909,132 @@ void CameraDaemon::registerRoutes()
                         response.body = "{\"error\":" + jsonString(error) + "}";
                         return response;
                 }
+                camera_reconfigure_.store(true);
                 response.body = buildSettingsJson(getSettings());
                 return response;
         });
 
         server_.addHandler("POST", "/capture/still", [this](HttpRequest const &) {
-                joinFinishedVideoThread();
-
                 HttpResponse response;
-                CameraSettings settings;
+                // Arm a one-shot still capture via the background camera loop.
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (session_.active)
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        still_result_.clear();
+                        still_pending_ = true;
+                }
+
+                // Wait for one frame to be written (with a timeout).
+                std::vector<std::string> frames;
+                {
+                        std::unique_lock<std::mutex> lock(capture_mutex_);
+                        bool ok = still_cv_.wait_for(lock, std::chrono::seconds(5), [&] {
+                                return !still_result_.empty();
+                        });
+                        if (!ok)
                         {
-                                response.status_code = 409;
-                                response.body = "{\"error\":\"A session is already active\"}";
+                                response.status_code = 503;
+                                response.body = "{\"error\":\"Timed out waiting for still frame\"}";
                                 return response;
                         }
-                        session_.mode = SessionMode::Still;
-                        session_.active = true;
-                        session_.last_error.clear();
-                        settings = settings_;
+                        frames = still_result_;
+                        still_result_.clear();
                 }
 
-                CaptureResult result = runCineDngCapture(settings, true, nullptr);
-
+                // Update last_capture summary
                 {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        session_.active = false;
-                        session_.mode = SessionMode::None;
-                        if (result.success)
-                        {
-                                session_.last_error.clear();
-                                last_capture_.type = "still";
-                                last_capture_.frames = result.frames;
-                        }
-                        else
-                                session_.last_error = result.error;
-                }
-
-                if (!result.success)
-                {
-                        response.status_code = 500;
-                        response.body = "{\"error\":" + jsonString(result.error) + "}";
-                        return response;
+                        session_.last_error.clear();
+                        last_capture_.type = "still";
+                        last_capture_.frames = frames;
                 }
 
                 std::ostringstream body;
                 body << "{\"frames\":[";
-                for (size_t i = 0; i < result.frames.size(); ++i)
+                for (size_t i = 0; i < frames.size(); ++i)
                 {
-                        if (i)
-                                body << ',';
-                        body << jsonString(result.frames[i]);
+                        if (i) body << ',';
+                        body << jsonString(frames[i]);
                 }
-                body << "],\"count\":" << result.frames.size() << "}";
+                body << "],\"count\":" << frames.size() << "}";
                 response.body = body.str();
                 return response;
         });
 
-        server_.addHandler("POST", "/recordings/video", [this](HttpRequest const &) {
-                joinFinishedVideoThread();
-
+server_.addHandler("POST", "/recordings/video", [this](HttpRequest const &) {
                 HttpResponse response;
-                CameraSettings settings;
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (session_.active)
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        if (video_recording_)
                         {
                                 response.status_code = 409;
-                                response.body = "{\"error\":\"A session is already active\"}";
+                                response.body = "{\"error\":\"Video already recording\"}";
                                 return response;
                         }
+                        video_recording_ = true;
+                }
+                {
+                        std::lock_guard<std::mutex> lock(mutex_);
                         session_.mode = SessionMode::Video;
                         session_.active = true;
                         session_.last_error.clear();
-                        settings = settings_;
-                        video_stop_flag_.store(false);
                 }
-
-                try
-                {
-                        video_thread_ = std::thread(&CameraDaemon::runVideoCapture, this, settings);
-                }
-                catch (std::exception const &ex)
-                {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        session_.active = false;
-                        session_.mode = SessionMode::None;
-                        session_.last_error = ex.what();
-                        response.status_code = 500;
-                        response.body = "{\"error\":" + jsonString(ex.what()) + "}";
-                        return response;
-                }
-
                 response.body = buildStatusJson();
                 return response;
         });
 
-        server_.addHandler("DELETE", "/recordings/video", [this](HttpRequest const &) {
+server_.addHandler("DELETE", "/recordings/video", [this](HttpRequest const &) {
                 HttpResponse response;
-                std::thread thread_to_join;
-                bool active_video = false;
+                bool was_active = false;
                 {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (session_.active && session_.mode == SessionMode::Video)
-                        {
-                                video_stop_flag_.store(true);
-                                thread_to_join = std::move(video_thread_);
-                                active_video = true;
-                        }
-                        else if (video_thread_.joinable())
-                                thread_to_join = std::move(video_thread_);
+                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                        was_active = video_recording_;
+                        video_recording_ = false;
                 }
-
-                if (thread_to_join.joinable())
-                        thread_to_join.join();
-
-                if (!active_video)
+                if (!was_active)
                 {
                         response.status_code = 409;
                         response.body = "{\"error\":\"No active video session\"}";
                         return response;
                 }
-
+                {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        session_.active = false;
+                        session_.mode = SessionMode::None;
+                }
                 response.body = buildStatusJson();
                 return response;
         });
 
-        server_.addHandler("GET", "/preview", [this](HttpRequest const &) {
+server_.addHandler("GET", "/preview", [this](HttpRequest const &) {
                 HttpResponse response;
                 response.content_type = "image/jpeg";
                 response.headers.emplace_back("Cache-Control", "no-cache, no-store, must-revalidate");
                 response.headers.emplace_back("Pragma", "no-cache");
 
                 std::vector<uint8_t> jpeg;
-                CameraSettings settings = getSettings();
-                std::string error;
-                if (!capturePreviewSnapshot(settings, jpeg, error))
+                uint64_t seq_before;
                 {
-                        response.status_code = 503;
-                        response.content_type = "application/json";
-                        response.body = "{\"error\":" + jsonString(error) + "}";
-                        return response;
+                        std::unique_lock<std::mutex> lock(preview_mutex_);
+                        seq_before = preview_seq_;
+                        if (latest_jpeg_.empty())
+                        {
+                                preview_cv_.wait_for(lock, std::chrono::milliseconds(1000), [&]{ return preview_seq_ != seq_before && !latest_jpeg_.empty(); });
+                        }
+                        if (latest_jpeg_.empty())
+                        {
+                                response.status_code = 503;
+                                response.content_type = "application/json";
+                                response.body = "{\"error\":\"No preview available\"}";
+                                return response;
+                        }
+                        jpeg = latest_jpeg_;
                 }
-
                 response.body.assign(reinterpret_cast<const char *>(jpeg.data()), jpeg.size());
                 return response;
         });
 
         server_.addStreamHandler("GET", "/preview/stream", [this](int client_fd, HttpRequest const &)
         {
-                // If a stream is already active, refuse additional clients for now.
-                bool expected = false;
-                if (!streaming_active_.compare_exchange_strong(expected, true))
-                {
-                        const char *busy =
-                                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n"
-                                "Content-Length: 38\r\nConnection: close\r\n\r\n{\"error\":\"Preview stream busy\"}";
-                        ::send(client_fd, busy, strlen(busy), 0);
-                        return;
-                }
-
-                // Write streaming headers
                 const char *hdr =
                         "HTTP/1.1 200 OK\r\n"
                         "Connection: close\r\n"
@@ -930,170 +1042,309 @@ void CameraDaemon::registerRoutes()
                         "Pragma: no-cache\r\n"
                         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
                 ::send(client_fd, hdr, strlen(hdr), 0);
-
-                streamPreviewMJPEG(client_fd);
-                streaming_active_.store(false);
+                streamClientLoop(client_fd);
         });
 }
 
-void CameraDaemon::joinFinishedVideoThread()
+void CameraDaemon::startCameraLoop()
 {
-        std::thread thread;
-        {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (session_.active)
-                        return;
-                if (!video_thread_.joinable())
-                        return;
-                thread = std::move(video_thread_);
-        }
-        if (thread.joinable())
-                thread.join();
+        if (camera_thread_.joinable())
+                return;
+        camera_stop_.store(false);
+        camera_thread_ = std::thread(&CameraDaemon::cameraLoop, this);
 }
 
-void CameraDaemon::runVideoCapture(CameraSettings settings)
+void CameraDaemon::stopCameraLoop()
 {
-        CaptureResult result = runCineDngCapture(settings, false, &video_stop_flag_);
+        camera_stop_.store(true);
+        if (camera_thread_.joinable())
+                camera_thread_.join();
+}
 
+void CameraDaemon::cameraLoop()
+{
+        while (!camera_stop_.load())
         {
-                std::lock_guard<std::mutex> lock(mutex_);
-                video_stop_flag_.store(false);
-                if (result.success)
+                try
                 {
-                        session_.last_error.clear();
-                        last_capture_.type = "video";
-                        last_capture_.frames = std::move(result.frames);
+                        PreviewEncoder app;
+                        VideoOptions *options = app.GetOptions();
+                        // Default-initialise Options
+                        char arg0[] = "rpicam-daemon";
+                        char *argv[] = { arg0 };
+                        int argc = 1;
+                        options->Parse(argc, argv);
+
+                        CameraSettings settings = getSettings();
+                        applySettingsToOptions(settings, *options, true /* request raw */);
+
+                        // Set callbacks that forward to an active DNG writer when present
+                        app.SetEncodeOutputReadyCallback([this](void *mem, size_t size, int64_t ts, bool key) {
+                                std::shared_ptr<DngOutput> out;
+                                {
+                                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                                        out = active_output_;
+                                }
+                                if (out)
+                                        out->OutputReady(mem, size, ts, key);
+                        });
+                        app.SetMetadataReadyCallback([this](libcamera::ControlList &ctrls) {
+                                std::shared_ptr<DngOutput> out;
+                                {
+                                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                                        out = active_output_;
+                                }
+                                if (out)
+                                        out->MetadataReady(ctrls);
+                        });
+
+                        app.OpenCamera();
+                        // Match rpicam-cinedng configuration: video + raw (raw is used for DNG).
+                        app.ConfigureVideo(RPiCamApp::FLAG_VIDEO_RAW);
+
+                        StreamInfo rinfo;
+                        libcamera::Stream *rstream = app.RawStream(&rinfo);
+                        if (!rstream)
+                                throw std::runtime_error("Raw stream unavailable");
+
+                        // Prepare DNG writer creation lambda
+                        auto ensure_output = [this, options, &rinfo, &app]() {
+                                if (active_output_)
+                                        return;
+                                auto out = std::make_shared<DngOutput>(options, rinfo, app.CameraModel());
+                                out->SetFrameWrittenCallback([this](std::string const &path) {
+                                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                                        if (still_pending_)
+                                        {
+                                                still_result_.push_back(path);
+                                                still_pending_ = false;
+                                                still_cv_.notify_all();
+                                        }
+                                        if (video_recording_)
+                                        {
+                                                std::lock_guard<std::mutex> lock2(mutex_);
+                                                last_capture_.type = "video";
+                                                last_capture_.frames.push_back(path);
+                                        }
+                                });
+                                active_output_ = std::move(out);
+                        };
+
+                        app.StartEncoder();
+                        app.StartCamera();
+
+                        while (!camera_stop_.load() && !camera_reconfigure_.load())
+                        {
+                                RPiCamEncoder::Msg msg = app.Wait();
+                                if (msg.type == RPiCamApp::MsgType::Timeout)
+                                {
+                                        LOG_ERROR("Device timeout detected, attempting a restart");
+                                        app.StopCamera();
+                                        app.StartCamera();
+                                        continue;
+                                }
+                                if (msg.type == RPiCamEncoder::MsgType::Quit)
+                                        break;
+                                if (msg.type != RPiCamEncoder::MsgType::RequestComplete)
+                                        throw std::runtime_error("Unrecognised message from camera");
+
+                                CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
+
+                                // Update preview JPEG generated from RAW frame (disabled unless preview_enabled_)
+                                if (preview_enabled_)
+                                {
+                                        libcamera::FrameBuffer *buffer = completed_request->buffers[rstream];
+                                        BufferReadSync r(&app, buffer);
+                                        libcamera::Span<uint8_t> span = r.Get()[0];
+                                        // Convert RAW->grayscale preview and JPEG encode
+                                        auto make_raw_preview_jpeg = [](libcamera::Span<uint8_t> s, StreamInfo const &info, int quality) -> std::vector<uint8_t>
+                                        {
+                                                // Unpack to 16-bit buffer depending on format
+                                                auto fmt = info.pixel_format;
+                                                unsigned int w = info.width, h = info.height;
+                                                std::vector<uint16_t> raw16;
+                                                raw16.resize(w * h);
+                                                auto pack12 = [&](const uint8_t *src, uint16_t *dst){
+                                                        unsigned int w_align = w & ~1u;
+                                                        for (unsigned int y = 0; y < h; y++, src += info.stride)
+                                                        {
+                                                                const uint8_t *ptr = src;
+                                                                unsigned int x;
+                                                                for (x = 0; x < w_align; x += 2, ptr += 3)
+                                                                {
+                                                                        *dst++ = (ptr[0] << 4) | ((ptr[2] >> 0) & 15);
+                                                                        *dst++ = (ptr[1] << 4) | ((ptr[2] >> 4) & 15);
+                                                                }
+                                                                if (x < w)
+                                                                        *dst++ = (ptr[x & 1] << 4) | ((ptr[2] >> ((x & 1) << 2)) & 15);
+                                                        }
+                                                };
+                                                auto pack10 = [&](const uint8_t *src, uint16_t *dst){
+                                                        unsigned int w_align = w & ~3u;
+                                                        for (unsigned int y = 0; y < h; y++, src += info.stride)
+                                                        {
+                                                                const uint8_t *ptr = src;
+                                                                unsigned int x;
+                                                                for (x = 0; x < w_align; x += 4, ptr += 5)
+                                                                {
+                                                                        *dst++ = (ptr[0] << 2) | ((ptr[4] >> 0) & 3);
+                                                                        *dst++ = (ptr[1] << 2) | ((ptr[4] >> 2) & 3);
+                                                                        *dst++ = (ptr[2] << 2) | ((ptr[4] >> 4) & 3);
+                                                                        *dst++ = (ptr[3] << 2) | ((ptr[4] >> 6) & 3);
+                                                                }
+                                                                for (; x < w; x++)
+                                                                        *dst++ = (ptr[x & 3] << 2) | ((ptr[4] >> ((x & 3) << 1)) & 3);
+                                                        }
+                                                };
+                                                auto copy16 = [&](const uint8_t *src, uint16_t *dst){
+                                                        unsigned int stride = info.stride;
+                                                        for (unsigned int y = 0; y < h; y++)
+                                                        {
+                                                                memcpy(dst, src, 2 * w);
+                                                                dst += w;
+                                                                src += stride;
+                                                        }
+                                                };
+                                                bool done=false;
+                                                if (fmt == libcamera::formats::SRGGB12_CSI2P || fmt == libcamera::formats::SGRBG12_CSI2P ||
+                                                    fmt == libcamera::formats::SGBRG12_CSI2P || fmt == libcamera::formats::SBGGR12_CSI2P)
+                                                { pack12(s.data(), raw16.data()); done=true; }
+                                                else if (fmt == libcamera::formats::SRGGB10_CSI2P || fmt == libcamera::formats::SGRBG10_CSI2P ||
+                                                         fmt == libcamera::formats::SGBRG10_CSI2P || fmt == libcamera::formats::SBGGR10_CSI2P)
+                                                { pack10(s.data(), raw16.data()); done=true; }
+                                                else if (fmt == libcamera::formats::SRGGB16 || fmt == libcamera::formats::SGRBG16 ||
+                                                         fmt == libcamera::formats::SGBRG16 || fmt == libcamera::formats::SBGGR16)
+                                                { copy16(s.data(), raw16.data()); done=true; }
+                                                else if (fmt == libcamera::formats::RGGB_PISP_COMP1 || fmt == libcamera::formats::GRBG_PISP_COMP1 ||
+                                                         fmt == libcamera::formats::GBRG_PISP_COMP1 || fmt == libcamera::formats::BGGR_PISP_COMP1)
+                                                { uncompress_pisp(s.data(), info, raw16.data()); done=true; }
+                                                // Minimal support for PiSP mono compressed could be added similarly.
+                                                if (!done)
+                                                        return std::vector<uint8_t>();
+
+                                                // Build a half-res greyscale preview from 2x2 Bayer blocks
+                                                unsigned out_w = w / 2, out_h = h / 2;
+                                                std::vector<uint8_t> gray(out_w * out_h);
+                                                unsigned shift = (fmt == libcamera::formats::SRGGB10_CSI2P || fmt == libcamera::formats::SGRBG10_CSI2P ||
+                                                                  fmt == libcamera::formats::SGBRG10_CSI2P || fmt == libcamera::formats::SBGGR10_CSI2P) ? 10 :
+                                                                 ((fmt == libcamera::formats::SRGGB12_CSI2P || fmt == libcamera::formats::SGRBG12_CSI2P ||
+                                                                   fmt == libcamera::formats::SGBRG12_CSI2P || fmt == libcamera::formats::SBGGR12_CSI2P) ? 12 : 16);
+                                                for (unsigned y = 0; y + 1 < h; y += 2)
+                                                {
+                                                        const uint16_t *row0 = &raw16[y * w];
+                                                        const uint16_t *row1 = &raw16[(y + 1) * w];
+                                                        uint8_t *dst = &gray[(y / 2) * out_w];
+                                                        for (unsigned x = 0; x + 1 < w; x += 2)
+                                                        {
+                                                                uint32_t g = row0[x] + row0[x + 1] + row1[x] + row1[x + 1];
+                                                                g = g >> (shift - 6); // roughly scale to 8-bit with a bit of gamma
+                                                                if (g > 255) g = 255;
+                                                                *dst++ = (uint8_t)g;
+                                                        }
+                                                }
+
+                                                // Encode grayscale JPEG
+                                                struct jpeg_compress_struct cinfo;
+                                                struct jpeg_error_mgr jerr;
+                                                cinfo.err = jpeg_std_error(&jerr);
+                                                jpeg_create_compress(&cinfo);
+                                                unsigned char *encoded_buffer = nullptr;
+                                                unsigned long encoded_size = 0;
+                                                jpeg_mem_dest(&cinfo, &encoded_buffer, &encoded_size);
+                                                cinfo.image_width = out_w;
+                                                cinfo.image_height = out_h;
+                                                cinfo.input_components = 1;
+                                                cinfo.in_color_space = JCS_GRAYSCALE;
+                                                jpeg_set_defaults(&cinfo);
+                                                jpeg_set_quality(&cinfo, quality, TRUE);
+                                                jpeg_start_compress(&cinfo, TRUE);
+                                                while (cinfo.next_scanline < cinfo.image_height)
+                                                {
+                                                        JSAMPROW row_pointer = (JSAMPROW)&gray[cinfo.next_scanline * out_w];
+                                                        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+                                                }
+                                                jpeg_finish_compress(&cinfo);
+                                                std::vector<uint8_t> encoded(encoded_buffer, encoded_buffer + encoded_size);
+                                                jpeg_destroy_compress(&cinfo);
+                                                free(encoded_buffer);
+                                                return encoded;
+                                        };
+
+                                        std::vector<uint8_t> jpeg = make_raw_preview_jpeg(span, rinfo, 85);
+                                        if (!jpeg.empty())
+                                        {
+                                                std::lock_guard<std::mutex> lock(preview_mutex_);
+                                                latest_jpeg_ = std::move(jpeg);
+                                                preview_seq_++;
+                                        }
+                                        preview_cv_.notify_all();
+                                }
+
+                                // Handle capturing frames to DNG when requested
+                                bool need_output = false;
+                                bool keep_output = false;
+                                {
+                                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                                        need_output = video_recording_ || still_pending_;
+                                        keep_output = video_recording_;
+                                        if (need_output && !active_output_)
+                                                ensure_output();
+                                }
+                                if (need_output)
+                                        app.EncodeBuffer(completed_request, rstream);
+                                else
+                                {
+                                        // Drop any active output if not recording
+                                        std::lock_guard<std::mutex> lock(capture_mutex_);
+                                        if (active_output_ && !keep_output)
+                                                active_output_.reset();
+                                }
+                        }
+
+                        app.StopCamera();
+                        app.StopEncoder();
+
+                        if (camera_reconfigure_.load())
+                                camera_reconfigure_.store(false);
                 }
-                else
-                        session_.last_error = result.error;
-                session_.active = false;
-                session_.mode = SessionMode::None;
-        }
-}
-
-bool CameraDaemon::stopActiveVideo(std::string &error_message)
-{
-        error_message.clear();
-        std::thread thread;
-        {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (!session_.active || session_.mode != SessionMode::Video)
-                        {
-                                if (video_thread_.joinable())
-                                        thread = std::move(video_thread_);
-                                return false;
-                        }
-                        video_stop_flag_.store(true);
-                        thread = std::move(video_thread_);
-        }
-
-        if (thread.joinable())
-                thread.join();
-        return true;
-}
-
-void CameraDaemon::streamPreviewMJPEG(int client_fd)
-{
-        // Serialise camera usage for the entire stream lifetime
-        std::unique_lock<std::mutex> cam_lock(camera_guard_, std::defer_lock);
-        cam_lock.lock();
-
-        try
-        {
-                PreviewEncoder app;
-                VideoOptions *options = app.GetOptions();
-                // Default-initialise Options
-                char arg0[] = "rpicam-daemon";
-                char *argv[] = { arg0 };
-                int argc = 1;
-                options->Parse(argc, argv);
-
-                CameraSettings settings = getSettings();
-                applySettingsToOptions(settings, *options, false);
-                int quality = 85;
-
-                app.OpenCamera();
-                app.ConfigureVideo();
-
-                StreamInfo stream_info;
-                libcamera::Stream *stream = app.VideoStream(&stream_info);
-                if (!stream)
-                        throw std::runtime_error("Video stream unavailable for preview");
-                if (stream_info.pixel_format != libcamera::formats::YUV420)
-                        throw std::runtime_error("Preview stream must be YUV420");
-
-                std::atomic<bool> client_ok{true};
-                // Prepare encoder callbacks to convert and send frames
-                app.SetEncodeOutputReadyCallback([&](void *mem, size_t size, int64_t, bool) {
-                        if (!client_ok.load())
-                                return;
-                        try
-                        {
-                                libcamera::Span<uint8_t> span(static_cast<uint8_t *>(mem), size);
-                                std::vector<uint8_t> jpeg = encodeFrameToJpeg(span, stream_info, quality);
-                                if (jpeg.empty())
-                                        return;
-                                char header[256];
-                                int n = snprintf(header, sizeof(header),
-                                                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-                                                 jpeg.size());
-                                if (n < 0)
-                                {
-                                        client_ok.store(false);
-                                        return;
-                                }
-                                if (::send(client_fd, header, n, 0) < 0)
-                                {
-                                        client_ok.store(false);
-                                        return;
-                                }
-                                if (::send(client_fd, reinterpret_cast<const char *>(jpeg.data()), jpeg.size(), 0) < 0)
-                                {
-                                        client_ok.store(false);
-                                        return;
-                                }
-                                static const char *crlf = "\r\n";
-                                if (::send(client_fd, crlf, 2, 0) < 0)
-                                {
-                                        client_ok.store(false);
-                                        return;
-                                }
-                        }
-                        catch (...)
-                        {
-                                client_ok.store(false);
-                        }
-                });
-
-                app.StartEncoder();
-                app.StartCamera();
-
-                while (client_ok.load())
+                catch (std::exception const &ex)
                 {
-                        RPiCamEncoder::Msg msg = app.Wait();
-                        if (msg.type == RPiCamApp::MsgType::Timeout)
-                        {
-                                LOG_ERROR("Device timeout detected, attempting a restart");
-                                app.StopCamera();
-                                app.StartCamera();
-                                continue;
-                        }
-                        if (msg.type == RPiCamEncoder::MsgType::Quit)
-                                break;
-                        if (msg.type != RPiCamEncoder::MsgType::RequestComplete)
-                                throw std::runtime_error("Unrecognised message from camera");
-
-                        CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
-                        if (!app.EncodeBuffer(completed_request, stream))
-                                continue;
+                        LOG_ERROR("Camera loop error: " << ex.what());
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
-
-                app.StopCamera();
-                app.StopEncoder();
         }
-        catch (std::exception const &ex)
+}
+
+void CameraDaemon::streamClientLoop(int client_fd)
+{
+        uint64_t last_seq = 0;
+        while (true)
         {
-                LOG_ERROR("Preview stream ended: " << ex.what());
+            std::vector<uint8_t> jpeg;
+            {
+                std::unique_lock<std::mutex> lock(preview_mutex_);
+                preview_cv_.wait_for(lock, std::chrono::seconds(2), [&]{ return preview_seq_ != last_seq || camera_stop_.load(); });
+                if (camera_stop_.load())
+                        break;
+                if (preview_seq_ == last_seq || latest_jpeg_.empty())
+                        continue;
+                last_seq = preview_seq_;
+                jpeg = latest_jpeg_;
+            }
+
+            char header[256];
+            int n = snprintf(header, sizeof(header),
+                             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                             jpeg.size());
+            if (n <= 0)
+                    break;
+            if (::send(client_fd, header, n, 0) < 0)
+                    break;
+            if (::send(client_fd, reinterpret_cast<const char *>(jpeg.data()), jpeg.size(), 0) < 0)
+                    break;
+            static const char *crlf = "\r\n";
+            if (::send(client_fd, crlf, 2, 0) < 0)
+                    break;
         }
 }
 
