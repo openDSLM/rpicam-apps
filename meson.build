@@ -34,6 +34,7 @@ elif neon == 'armv8-neon'
 endif
 
 dl_dep = dependency('dl', required : true)
+threads_dep = dependency('threads', required : true)
 libcamera_dep = dependency('libcamera', required : true)
 
 summary({
