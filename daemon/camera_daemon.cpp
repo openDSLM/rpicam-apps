@@ -43,6 +43,30 @@ protected:
         void createEncoder() override { encoder_ = std::unique_ptr<Encoder>(new NullEncoder(GetOptions())); }
 };
 
+class PreviewSubscription
+{
+public:
+        PreviewSubscription(std::atomic<int> &clients, std::atomic<bool> &enabled)
+                : clients_(clients), enabled_(enabled)
+        {
+                clients_.fetch_add(1, std::memory_order_relaxed);
+                enabled_.store(true, std::memory_order_relaxed);
+        }
+
+        ~PreviewSubscription()
+        {
+                if (clients_.fetch_sub(1, std::memory_order_relaxed) == 1)
+                        enabled_.store(false, std::memory_order_relaxed);
+        }
+
+        PreviewSubscription(PreviewSubscription const &) = delete;
+        PreviewSubscription &operator=(PreviewSubscription const &) = delete;
+
+private:
+        std::atomic<int> &clients_;
+        std::atomic<bool> &enabled_;
+};
+
 std::vector<uint8_t> encodeFrameToJpeg(libcamera::Span<uint8_t> span, StreamInfo const &info, int quality)
 {
         if (!span.size())
@@ -110,165 +134,6 @@ std::vector<uint8_t> encodeFrameToJpeg(libcamera::Span<uint8_t> span, StreamInfo
         jpeg_destroy_compress(&cinfo);
         free(encoded_buffer);
         return encoded;
-}
-
-// Minimal RAW unpack/decompress helpers (adapted from image/dng.cpp)
-__attribute__((unused)) static void unpack10(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
-{
-        unsigned int w_align = info.width & ~3u;
-        for (unsigned int y = 0; y < info.height; y++, src += info.stride)
-        {
-                const uint8_t *ptr = src;
-                unsigned int x;
-                for (x = 0; x < w_align; x += 4, ptr += 5)
-                {
-                        *dst++ = (ptr[0] << 2) | ((ptr[4] >> 0) & 3);
-                        *dst++ = (ptr[1] << 2) | ((ptr[4] >> 2) & 3);
-                        *dst++ = (ptr[2] << 2) | ((ptr[4] >> 4) & 3);
-                        *dst++ = (ptr[3] << 2) | ((ptr[4] >> 6) & 3);
-                }
-                for (; x < info.width; x++)
-                        *dst++ = (ptr[x & 3] << 2) | ((ptr[4] >> ((x & 3) << 1)) & 3);
-        }
-}
-
-__attribute__((unused)) static void unpack12(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
-{
-        unsigned int w_align = info.width & ~1u;
-        for (unsigned int y = 0; y < info.height; y++, src += info.stride)
-        {
-                const uint8_t *ptr = src;
-                unsigned int x;
-                for (x = 0; x < w_align; x += 2, ptr += 3)
-                {
-                        *dst++ = (ptr[0] << 4) | ((ptr[2] >> 0) & 15);
-                        *dst++ = (ptr[1] << 4) | ((ptr[2] >> 4) & 15);
-                }
-                if (x < info.width)
-                        *dst++ = (ptr[x & 1] << 4) | ((ptr[2] >> ((x & 1) << 2)) & 15);
-        }
-}
-
-__attribute__((unused)) static void unpack16(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
-{
-        unsigned int w = info.width;
-        for (unsigned int y = 0; y < info.height; y++)
-        {
-                memcpy(dst, src, 2 * w);
-                dst += w;
-                src += info.stride;
-        }
-}
-
-#define COMPRESS_OFFSET 2048
-#define COMPRESS_MODE 1
-static uint16_t pp_post(uint16_t a)
-{
-        if (COMPRESS_MODE & 2)
-        {
-                if (COMPRESS_MODE == 3 && a < 0x4000)
-                        a = a >> 2;
-                else if (a < 0x1000)
-                        a = a >> 4;
-                else if (a < 0x1800)
-                        a = (a - 0x800) >> 3;
-                else if (a < 0x3000)
-                        a = (a - 0x1000) >> 2;
-                else if (a < 0x6000)
-                        a = (a - 0x2000) >> 1;
-                else if (a < 0xC000)
-                        a = (a - 0x4000);
-                else
-                        a = 2 * (a - 0x8000);
-        }
-        return std::min<uint16_t>(0xFFFF, a + COMPRESS_OFFSET);
-}
-
-static uint16_t pp_dequant(uint16_t q, int qmode)
-{
-        switch (qmode)
-        {
-        case 0: return (q < 320) ? 16 * q : 32 * (q - 160);
-        case 1: return 64 * q;
-        case 2: return 128 * q;
-        default: return (q < 94) ? 256 * q : std::min(0xFFFF, (int)512 * (q - 47));
-        }
-}
-
-static void pp_subblock(uint16_t *d, uint32_t w)
-{
-        int q[4];
-        int qmode = (w & 3);
-        if (qmode < 3)
-        {
-                int field0 = (w >> 2) & 511;
-                int field1 = (w >> 11) & 127;
-                int field2 = (w >> 18) & 127;
-                int field3 = (w >> 25) & 127;
-                if (qmode == 2 && field0 >= 384)
-                {
-                        q[1] = field0;
-                        q[2] = field1 + 384;
-                }
-                else
-                {
-                        q[1] = (field1 >= 64) ? field0 : field0 + 64 - field1;
-                        q[2] = (field1 >= 64) ? field0 + field1 - 64 : field0;
-                }
-                int p1 = std::max(0, q[1] - 64);
-                if (qmode == 2) p1 = std::min(384, p1);
-                int p2 = std::max(0, q[2] - 64);
-                if (qmode == 2) p2 = std::min(384, p2);
-                q[0] = p1 + field2;
-                q[3] = p2 + field3;
-        }
-        else
-        {
-                int pack0 = (w >> 2) & 32767;
-                int pack1 = (w >> 17) & 32767;
-                q[0] = (pack0 & 15) + 16 * ((pack0 >> 8) / 11);
-                q[1] = (pack0 & 480) / 16 + 16 * ((pack0 >> 11) % 11);
-                q[2] = (pack1 & 15) + 16 * ((pack1 >> 8) / 11);
-                q[3] = (pack1 & 480) / 16 + 16 * ((pack1 >> 11) % 11);
-        }
-        d[0] = pp_post(pp_dequant(q[0], qmode));
-        d[1] = pp_post(pp_dequant(q[1], qmode));
-        d[2] = pp_post(pp_dequant(q[2], qmode));
-        d[3] = pp_post(pp_dequant(q[3], qmode));
-}
-
-static void uncompress_pisp(const uint8_t *src, const StreamInfo &info, uint16_t *dst)
-{
-        // Decompression requires width padded to 8 pixels
-        unsigned int w = (info.width + 7) & ~7u;
-        unsigned int h = info.height;
-        std::vector<uint32_t> wdata(w * h / 2);
-
-        // First stage: dequantize
-        for (unsigned int i = 0; i < wdata.size(); i++)
-        {
-                int a = (src[0] << 0) | (src[1] << 8) | (src[2] << 16);
-                int b = (src[3] << 0) | (src[4] << 8) | (src[5] << 16);
-                wdata[i] = a | (b << 24);
-                src += 6;
-        }
-
-        // Second stage: process each 2x2 sub-block
-        std::vector<uint16_t> tmp(w * h);
-        uint32_t *wp = wdata.data();
-        for (unsigned int y = 0; y < h; y += 2)
-        {
-                for (unsigned int x = 0; x < w; x += 2)
-                {
-                        pp_subblock(&tmp[y * w + x], *wp++);
-                }
-        }
-
-        // Copy out to dst with original width stride
-        for (unsigned int y = 0; y < h; y++)
-        {
-                memcpy(&dst[y * info.width], &tmp[y * w], info.width * sizeof(uint16_t));
-        }
 }
 
 } // namespace
@@ -1038,7 +903,8 @@ server_.addHandler("DELETE", "/recordings/video", [this](HttpRequest const &) {
                 return response;
         });
 
-server_.addHandler("GET", "/preview", [this](HttpRequest const &) {
+        server_.addHandler("GET", "/preview", [this](HttpRequest const &) {
+                PreviewSubscription preview_client(preview_clients_, preview_enabled_);
                 HttpResponse response;
                 response.content_type = "image/jpeg";
                 response.headers.emplace_back("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -1068,6 +934,7 @@ server_.addHandler("GET", "/preview", [this](HttpRequest const &) {
 
         server_.addStreamHandler("GET", "/preview/stream", [this](int client_fd, HttpRequest const &)
         {
+                PreviewSubscription preview_client(preview_clients_, preview_enabled_);
                 const char *hdr =
                         "HTTP/1.1 200 OK\r\n"
                         "Connection: close\r\n"
@@ -1135,6 +1002,11 @@ void CameraDaemon::cameraLoop()
                         // Match rpicam-cinedng configuration: video + raw (raw is used for DNG).
                         app.ConfigureVideo(RPiCamApp::FLAG_VIDEO_RAW);
 
+                        StreamInfo vinfo;
+                        libcamera::Stream *vstream = app.VideoStream(&vinfo);
+                        if (!vstream)
+                                throw std::runtime_error("Video stream unavailable for preview");
+
                         StreamInfo rinfo;
                         libcamera::Stream *rstream = app.RawStream(&rinfo);
                         if (!rstream)
@@ -1183,132 +1055,22 @@ void CameraDaemon::cameraLoop()
 
                                 CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
 
-                                // Update preview JPEG generated from RAW frame (disabled unless preview_enabled_)
-                                if (preview_enabled_)
+                                // Update preview JPEG from the video stream (disabled unless preview_enabled_)
+                                if (preview_enabled_.load(std::memory_order_relaxed))
                                 {
-                                        libcamera::FrameBuffer *buffer = completed_request->buffers[rstream];
-                                        BufferReadSync r(&app, buffer);
-                                        libcamera::Span<uint8_t> span = r.Get()[0];
-                                        // Convert RAW->grayscale preview and JPEG encode
-                                        auto make_raw_preview_jpeg = [](libcamera::Span<uint8_t> s, StreamInfo const &info, int quality) -> std::vector<uint8_t>
+                                        libcamera::FrameBuffer *buffer = completed_request->buffers[vstream];
+                                        BufferReadSync v(&app, buffer);
+                                        auto const &planes = v.Get();
+                                        if (!planes.empty())
                                         {
-                                                // Unpack to 16-bit buffer depending on format
-                                                auto fmt = info.pixel_format;
-                                                unsigned int w = info.width, h = info.height;
-                                                std::vector<uint16_t> raw16;
-                                                raw16.resize(w * h);
-                                                auto pack12 = [&](const uint8_t *src, uint16_t *dst){
-                                                        unsigned int w_align = w & ~1u;
-                                                        for (unsigned int y = 0; y < h; y++, src += info.stride)
-                                                        {
-                                                                const uint8_t *ptr = src;
-                                                                unsigned int x;
-                                                                for (x = 0; x < w_align; x += 2, ptr += 3)
-                                                                {
-                                                                        *dst++ = (ptr[0] << 4) | ((ptr[2] >> 0) & 15);
-                                                                        *dst++ = (ptr[1] << 4) | ((ptr[2] >> 4) & 15);
-                                                                }
-                                                                if (x < w)
-                                                                        *dst++ = (ptr[x & 1] << 4) | ((ptr[2] >> ((x & 1) << 2)) & 15);
-                                                        }
-                                                };
-                                                auto pack10 = [&](const uint8_t *src, uint16_t *dst){
-                                                        unsigned int w_align = w & ~3u;
-                                                        for (unsigned int y = 0; y < h; y++, src += info.stride)
-                                                        {
-                                                                const uint8_t *ptr = src;
-                                                                unsigned int x;
-                                                                for (x = 0; x < w_align; x += 4, ptr += 5)
-                                                                {
-                                                                        *dst++ = (ptr[0] << 2) | ((ptr[4] >> 0) & 3);
-                                                                        *dst++ = (ptr[1] << 2) | ((ptr[4] >> 2) & 3);
-                                                                        *dst++ = (ptr[2] << 2) | ((ptr[4] >> 4) & 3);
-                                                                        *dst++ = (ptr[3] << 2) | ((ptr[4] >> 6) & 3);
-                                                                }
-                                                                for (; x < w; x++)
-                                                                        *dst++ = (ptr[x & 3] << 2) | ((ptr[4] >> ((x & 3) << 1)) & 3);
-                                                        }
-                                                };
-                                                auto copy16 = [&](const uint8_t *src, uint16_t *dst){
-                                                        unsigned int stride = info.stride;
-                                                        for (unsigned int y = 0; y < h; y++)
-                                                        {
-                                                                memcpy(dst, src, 2 * w);
-                                                                dst += w;
-                                                                src += stride;
-                                                        }
-                                                };
-                                                bool done=false;
-                                                if (fmt == libcamera::formats::SRGGB12_CSI2P || fmt == libcamera::formats::SGRBG12_CSI2P ||
-                                                    fmt == libcamera::formats::SGBRG12_CSI2P || fmt == libcamera::formats::SBGGR12_CSI2P)
-                                                { pack12(s.data(), raw16.data()); done=true; }
-                                                else if (fmt == libcamera::formats::SRGGB10_CSI2P || fmt == libcamera::formats::SGRBG10_CSI2P ||
-                                                         fmt == libcamera::formats::SGBRG10_CSI2P || fmt == libcamera::formats::SBGGR10_CSI2P)
-                                                { pack10(s.data(), raw16.data()); done=true; }
-                                                else if (fmt == libcamera::formats::SRGGB16 || fmt == libcamera::formats::SGRBG16 ||
-                                                         fmt == libcamera::formats::SGBRG16 || fmt == libcamera::formats::SBGGR16)
-                                                { copy16(s.data(), raw16.data()); done=true; }
-                                                else if (fmt == libcamera::formats::RGGB_PISP_COMP1 || fmt == libcamera::formats::GRBG_PISP_COMP1 ||
-                                                         fmt == libcamera::formats::GBRG_PISP_COMP1 || fmt == libcamera::formats::BGGR_PISP_COMP1)
-                                                { uncompress_pisp(s.data(), info, raw16.data()); done=true; }
-                                                // Minimal support for PiSP mono compressed could be added similarly.
-                                                if (!done)
-                                                        return std::vector<uint8_t>();
-
-                                                // Build a half-res greyscale preview from 2x2 Bayer blocks
-                                                unsigned out_w = w / 2, out_h = h / 2;
-                                                std::vector<uint8_t> gray(out_w * out_h);
-                                                unsigned shift = (fmt == libcamera::formats::SRGGB10_CSI2P || fmt == libcamera::formats::SGRBG10_CSI2P ||
-                                                                  fmt == libcamera::formats::SGBRG10_CSI2P || fmt == libcamera::formats::SBGGR10_CSI2P) ? 10 :
-                                                                 ((fmt == libcamera::formats::SRGGB12_CSI2P || fmt == libcamera::formats::SGRBG12_CSI2P ||
-                                                                   fmt == libcamera::formats::SGBRG12_CSI2P || fmt == libcamera::formats::SBGGR12_CSI2P) ? 12 : 16);
-                                                for (unsigned y = 0; y + 1 < h; y += 2)
+                                                libcamera::Span<uint8_t> span = planes[0];
+                                                std::vector<uint8_t> jpeg = encodeFrameToJpeg(span, vinfo, 85);
+                                                if (!jpeg.empty())
                                                 {
-                                                        const uint16_t *row0 = &raw16[y * w];
-                                                        const uint16_t *row1 = &raw16[(y + 1) * w];
-                                                        uint8_t *dst = &gray[(y / 2) * out_w];
-                                                        for (unsigned x = 0; x + 1 < w; x += 2)
-                                                        {
-                                                                uint32_t g = row0[x] + row0[x + 1] + row1[x] + row1[x + 1];
-                                                                g = g >> (shift - 6); // roughly scale to 8-bit with a bit of gamma
-                                                                if (g > 255) g = 255;
-                                                                *dst++ = (uint8_t)g;
-                                                        }
+                                                        std::lock_guard<std::mutex> lock(preview_mutex_);
+                                                        latest_jpeg_ = std::move(jpeg);
+                                                        preview_seq_++;
                                                 }
-
-                                                // Encode grayscale JPEG
-                                                struct jpeg_compress_struct cinfo;
-                                                struct jpeg_error_mgr jerr;
-                                                cinfo.err = jpeg_std_error(&jerr);
-                                                jpeg_create_compress(&cinfo);
-                                                unsigned char *encoded_buffer = nullptr;
-                                                unsigned long encoded_size = 0;
-                                                jpeg_mem_dest(&cinfo, &encoded_buffer, &encoded_size);
-                                                cinfo.image_width = out_w;
-                                                cinfo.image_height = out_h;
-                                                cinfo.input_components = 1;
-                                                cinfo.in_color_space = JCS_GRAYSCALE;
-                                                jpeg_set_defaults(&cinfo);
-                                                jpeg_set_quality(&cinfo, quality, TRUE);
-                                                jpeg_start_compress(&cinfo, TRUE);
-                                                while (cinfo.next_scanline < cinfo.image_height)
-                                                {
-                                                        JSAMPROW row_pointer = (JSAMPROW)&gray[cinfo.next_scanline * out_w];
-                                                        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
-                                                }
-                                                jpeg_finish_compress(&cinfo);
-                                                std::vector<uint8_t> encoded(encoded_buffer, encoded_buffer + encoded_size);
-                                                jpeg_destroy_compress(&cinfo);
-                                                free(encoded_buffer);
-                                                return encoded;
-                                        };
-
-                                        std::vector<uint8_t> jpeg = make_raw_preview_jpeg(span, rinfo, 85);
-                                        if (!jpeg.empty())
-                                        {
-                                                std::lock_guard<std::mutex> lock(preview_mutex_);
-                                                latest_jpeg_ = std::move(jpeg);
-                                                preview_seq_++;
                                         }
                                         preview_cv_.notify_all();
                                 }

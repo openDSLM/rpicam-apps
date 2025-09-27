@@ -113,7 +113,8 @@ private:
         std::condition_variable preview_cv_;
         std::vector<uint8_t> latest_jpeg_;
         uint64_t preview_seq_ = 0;
-        bool preview_enabled_ = false; // generate preview from RAW when true
+        std::atomic<bool> preview_enabled_{false}; // generate preview frames when true
+        std::atomic<int> preview_clients_{0};
 
         // Capture state shared with camera loop
         std::mutex capture_mutex_;
